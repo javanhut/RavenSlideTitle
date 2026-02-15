@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
+RAVEN_SLIDE_START="${RAVEN_SLIDE_START:-21}"
+RAVEN_SLIDE_END="${RAVEN_SLIDE_END:-40}"
+RAVEN_CAROUSEL_WORKSPACE="${RAVEN_CAROUSEL_WORKSPACE:-90}"
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/ravenslide-carousel-${HYPRLAND_INSTANCE_SIGNATURE:-default}.json"
+
+die() {
+  echo "raven-carousel: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+validate_int() {
+  local name="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a positive integer"
+}
+
+hypr_json() {
+  local target="$1"
+  local out
+  if ! out="$("$HYPRCTL_BIN" "$target" -j 2>/dev/null)"; then
+    die "failed to query hyprctl '$target' (are you inside a Hyprland session?)"
+  fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+    die "hyprctl returned invalid JSON for '$target' (are you inside a Hyprland session?)"
+  fi
+  printf '%s\n' "$out"
+}
+
+dispatch() {
+  local name="$1"
+  shift
+  local args="$*"
+  "$HYPRCTL_BIN" dispatch "$name" "$args" >/dev/null
+}
+
+state_exists() {
+  [[ -s "$STATE_FILE" ]]
+}
+
+read_state() {
+  state_exists || die "carousel is not active"
+  jq -e . "$STATE_FILE" >/dev/null 2>&1 || die "state file is corrupt: $STATE_FILE"
+  cat "$STATE_FILE"
+}
+
+write_state() {
+  local json="$1"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  printf '%s\n' "$json" >"$STATE_FILE"
+}
+
+clear_state() {
+  rm -f "$STATE_FILE"
+}
+
+panel_windows_json() {
+  hypr_json clients \
+    | jq -c --argjson s "$RAVEN_SLIDE_START" --argjson e "$RAVEN_SLIDE_END" --argjson cws "$RAVEN_CAROUSEL_WORKSPACE" '
+      map(
+        select(
+          .workspace.id >= $s and .workspace.id <= $e and
+          .workspace.id != $cws and
+          (.mapped // true) == true and
+          (.hidden // false) == false
+        )
+        | {
+            address: .address,
+            workspace: .workspace.id,
+            floating: (.floating // false),
+            title: (.title // ""),
+            class: (.class // "")
+          }
+      )
+      | unique_by(.address)
+      | sort_by(.workspace, .address)
+    '
+}
+
+focused_monitor_box() {
+  hypr_json monitors \
+    | jq -r '
+      (map(select(.focused == true))[0] // .[0]) as $m
+      | "\($m.x) \($m.y) \($m.width) \($m.height)"
+    '
+}
+
+apply_layout() {
+  local state
+  state="$(read_state)"
+
+  local active_ws
+  active_ws="$(hypr_json activeworkspace | jq -r '.id')"
+  local carousel_ws
+  carousel_ws="$(jq -r '.carousel_workspace' <<<"$state")"
+  if [[ "$active_ws" != "$carousel_ws" ]]; then
+    dispatch workspace "$carousel_ws"
+  fi
+
+  local monitor_box
+  monitor_box="$(focused_monitor_box)"
+  local mx my mw mh
+  read -r mx my mw mh <<<"$monitor_box"
+
+  local selected
+  selected="$(jq -r '.selected' <<<"$state")"
+
+  mapfile -t addresses < <(jq -r '.windows[].address' <<<"$state")
+  local count="${#addresses[@]}"
+  (( count > 0 )) || die "no windows in carousel state"
+
+  # Keep every card strictly inside the active monitor bounds.
+  local margin_x=$((mw * 3 / 100))
+  local margin_y=$((mh * 4 / 100))
+  local min_x=$((mx + margin_x))
+  local min_y=$((my + margin_y))
+  local max_x=$((mx + mw - margin_x))
+  local max_y=$((my + mh - margin_y))
+
+  local i
+  local selected_addr="${addresses[$selected]}"
+  local sel_w=0 sel_h=0 sel_x=0 sel_y=0
+
+  for i in "${!addresses[@]}"; do
+    local addr="${addresses[$i]}"
+    local delta=$((i - selected))
+    local absd="$delta"
+    (( absd < 0 )) && absd=$(( -absd ))
+    local sign=1
+    (( delta < 0 )) && sign=-1
+
+    local ww wh xoff yoff
+    if (( absd == 0 )); then
+      ww=$((mw * 72 / 100))
+      wh=$((mh * 82 / 100))
+      xoff=0
+      yoff=0
+    elif (( absd == 1 )); then
+      ww=$((mw * 50 / 100))
+      wh=$((mh * 68 / 100))
+      xoff=$((sign * mw * 38 / 100))
+      yoff=$((mh * 5 / 100))
+    elif (( absd == 2 )); then
+      ww=$((mw * 36 / 100))
+      wh=$((mh * 56 / 100))
+      xoff=$((sign * mw * 62 / 100))
+      yoff=$((mh * 10 / 100))
+    else
+      ww=$((mw * 30 / 100))
+      wh=$((mh * 48 / 100))
+      xoff=$((sign * (mw * 80 / 100 + (absd - 3) * mw * 16 / 100)))
+      yoff=$((mh * 14 / 100))
+    fi
+
+    local x y
+    x=$((mx + (mw - ww) / 2 + xoff))
+    y=$((my + (mh - wh) / 2 + yoff))
+
+    # Clamp to monitor so the card never overlaps into other monitors/areas.
+    if (( x < min_x )); then
+      x="$min_x"
+    fi
+    if (( y < min_y )); then
+      y="$min_y"
+    fi
+    if (( x + ww > max_x )); then
+      x=$((max_x - ww))
+    fi
+    if (( y + wh > max_y )); then
+      y=$((max_y - wh))
+    fi
+
+    if [[ "$addr" == "$selected_addr" ]]; then
+      sel_w="$ww"
+      sel_h="$wh"
+      sel_x="$x"
+      sel_y="$y"
+    else
+      dispatch resizewindowpixel "exact $ww $wh,address:$addr"
+      dispatch movewindowpixel "exact $x $y,address:$addr"
+    fi
+  done
+
+  # Lay out selected card last so it is above other floating cards.
+  dispatch resizewindowpixel "exact $sel_w $sel_h,address:$selected_addr"
+  dispatch movewindowpixel "exact $sel_x $sel_y,address:$selected_addr"
+  dispatch focuswindow "address:$selected_addr"
+  "$HYPRCTL_BIN" dispatch bringactivetotop "" >/dev/null 2>&1 || true
+}
+
+restore_windows() {
+  local mode="$1"
+  local state
+  state="$(read_state)"
+
+  local selected_addr
+  selected_addr="$(jq -r '.windows[.selected].address' <<<"$state")"
+  local selected_ws
+  selected_ws="$(jq -r '.windows[.selected].workspace' <<<"$state")"
+  local previous_ws
+  previous_ws="$(jq -r '.active_workspace_before' <<<"$state")"
+
+  while IFS= read -r row; do
+    local addr ws was_floating
+    addr="$(jq -r '.address' <<<"$row")"
+    ws="$(jq -r '.workspace' <<<"$row")"
+    was_floating="$(jq -r '.floating' <<<"$row")"
+
+    dispatch movetoworkspacesilent "$ws,address:$addr"
+    if [[ "$was_floating" == "true" ]]; then
+      dispatch setfloating "address:$addr"
+    else
+      dispatch settiled "address:$addr"
+    fi
+  done < <(jq -c '.windows[]' <<<"$state")
+
+  if [[ "$mode" == "open" ]]; then
+    dispatch workspace "$selected_ws"
+    dispatch focuswindow "address:$selected_addr"
+    dispatch fullscreen "1 set"
+  else
+    dispatch workspace "$previous_ws"
+  fi
+}
+
+cmd_start() {
+  state_exists && die "carousel already active"
+
+  local windows_json
+  windows_json="$(panel_windows_json)"
+  local count
+  count="$(jq -r 'length' <<<"$windows_json")"
+  (( count > 0 )) || die "no panel windows found in ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+
+  local active_ws active_addr selected
+  active_ws="$(hypr_json activeworkspace | jq -r '.id')"
+  active_addr="$(hypr_json activewindow | jq -r '.address // ""')"
+  selected="$(jq -r --arg addr "$active_addr" '
+    (to_entries | map(select(.value.address == $addr)) | .[0].key) // 0
+  ' <<<"$windows_json")"
+
+  local state
+  state="$(jq -n \
+    --argjson active_ws "$active_ws" \
+    --argjson carousel_ws "$RAVEN_CAROUSEL_WORKSPACE" \
+    --argjson selected "$selected" \
+    --argjson windows "$windows_json" \
+    '{
+      active_workspace_before: $active_ws,
+      carousel_workspace: $carousel_ws,
+      selected: $selected,
+      windows: $windows
+    }'
+  )"
+  write_state "$state"
+
+  while IFS= read -r addr; do
+    dispatch movetoworkspacesilent "$RAVEN_CAROUSEL_WORKSPACE,address:$addr"
+    dispatch setfloating "address:$addr"
+    dispatch focuswindow "address:$addr"
+    dispatch fullscreen "0 unset" || true
+  done < <(jq -r '.windows[].address' <<<"$state")
+
+  dispatch workspace "$RAVEN_CAROUSEL_WORKSPACE"
+  apply_layout
+  echo "started:$count workspace:$RAVEN_CAROUSEL_WORKSPACE"
+}
+
+cmd_move_selection() {
+  local delta="$1"
+  local state
+  state="$(read_state)"
+
+  local count selected next
+  count="$(jq -r '.windows | length' <<<"$state")"
+  (( count > 0 )) || die "carousel state has no windows"
+  selected="$(jq -r '.selected' <<<"$state")"
+  next=$(((selected + delta + count) % count))
+
+  state="$(jq --argjson next "$next" '.selected = $next' <<<"$state")"
+  write_state "$state"
+  apply_layout
+  echo "selected:$next"
+}
+
+cmd_open() {
+  restore_windows open
+  clear_state
+  echo "opened:selected"
+}
+
+cmd_cancel() {
+  restore_windows cancel
+  clear_state
+  echo "cancelled"
+}
+
+cmd_toggle() {
+  if state_exists; then
+    cmd_open
+  else
+    cmd_start
+  fi
+}
+
+cmd_status() {
+  if state_exists; then
+    local count selected
+    count="$(jq -r '.windows | length' "$STATE_FILE")"
+    selected="$(jq -r '.selected' "$STATE_FILE")"
+    echo "active windows:$count selected:$selected state:$STATE_FILE"
+  else
+    echo "inactive state:$STATE_FILE"
+  fi
+}
+
+print_help() {
+  cat <<EOF
+raven-carousel: fullscreen panel carousel for Hyprland
+
+Usage:
+  raven-carousel start    Enter carousel mode with panel windows (${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END})
+  raven-carousel next     Move selection right
+  raven-carousel prev     Move selection left
+  raven-carousel open     Open selected panel and exit carousel
+  raven-carousel cancel   Exit carousel and return to previous workspace
+  raven-carousel toggle   Start carousel (or open selected if already active)
+  raven-carousel status   Show carousel state
+  raven-carousel help     Show this help
+
+Environment:
+  RAVEN_SLIDE_START (default: 21)
+  RAVEN_SLIDE_END (default: 40)
+  RAVEN_CAROUSEL_WORKSPACE (default: 90)
+  HYPRCTL_BIN (default: hyprctl)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+    print_help
+    return 0
+  fi
+
+  need_cmd "$HYPRCTL_BIN"
+  need_cmd jq
+  validate_int RAVEN_SLIDE_START "$RAVEN_SLIDE_START"
+  validate_int RAVEN_SLIDE_END "$RAVEN_SLIDE_END"
+  validate_int RAVEN_CAROUSEL_WORKSPACE "$RAVEN_CAROUSEL_WORKSPACE"
+  (( RAVEN_SLIDE_START <= RAVEN_SLIDE_END )) || die "RAVEN_SLIDE_START must be <= RAVEN_SLIDE_END"
+
+  case "$cmd" in
+    start)
+      cmd_start
+      ;;
+    next)
+      cmd_move_selection 1
+      ;;
+    prev)
+      cmd_move_selection -1
+      ;;
+    open)
+      cmd_open
+      ;;
+    cancel)
+      cmd_cancel
+      ;;
+    toggle)
+      cmd_toggle
+      ;;
+    status)
+      cmd_status
+      ;;
+    *)
+      die "unknown command: $cmd (try: raven-carousel help)"
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,6 +1,6 @@
 # RavenSlide
 
-RavenSlide gives Hyprland a fullscreen panel workflow: each app can live on its own workspace panel, and you switch context by sliding between occupied panels.
+RavenSlide gives Hyprland a fullscreen panel workflow: each app can live on its own workspace panel, and you switch context by sliding between occupied panels. It also includes a true carousel mode that lays panel windows out as floating cards so you can rotate and select one.
 
 ## Features
 
@@ -8,6 +8,8 @@ RavenSlide gives Hyprland a fullscreen panel workflow: each app can live on its 
 - Move active window to a fresh panel and fullscreen it
 - Launch apps directly into fresh panels
 - Cycle next/previous across occupied panels only
+- Runtime carousel mode with multiple cards visible at once
+- Carousel-like workspace motion preset (non-carousel mode)
 - Clear runtime errors if run outside a Hyprland session
 
 ## Requirements
@@ -18,12 +20,14 @@ RavenSlide gives Hyprland a fullscreen panel workflow: each app can live on its 
 
 ## Install
 
-1. Install the script:
+1. Install the scripts:
 
 ```bash
 mkdir -p ~/.config/hypr/scripts
 cp scripts/ravenslide ~/.config/hypr/scripts/ravenslide
-chmod +x ~/.config/hypr/scripts/ravenslide
+cp scripts/ravenslide-apply-carousel ~/.config/hypr/scripts/ravenslide-apply-carousel
+cp scripts/raven-carousel ~/.config/hypr/scripts/raven-carousel
+chmod +x ~/.config/hypr/scripts/ravenslide ~/.config/hypr/scripts/ravenslide-apply-carousel ~/.config/hypr/scripts/raven-carousel
 ```
 
 2. Install the Hyprland snippet:
@@ -42,7 +46,23 @@ source = ~/.config/hypr/ravenslide.conf
 
 Use this first if `hyprctl reload` has been unstable for you.
 
-1. Run direct commands:
+1. If not already installed, install both scripts:
+
+```bash
+mkdir -p ~/.config/hypr/scripts
+cp scripts/ravenslide ~/.config/hypr/scripts/ravenslide
+cp scripts/ravenslide-apply-carousel ~/.config/hypr/scripts/ravenslide-apply-carousel
+cp scripts/raven-carousel ~/.config/hypr/scripts/raven-carousel
+chmod +x ~/.config/hypr/scripts/ravenslide ~/.config/hypr/scripts/ravenslide-apply-carousel ~/.config/hypr/scripts/raven-carousel
+```
+
+2. Apply the runtime animation preset (non-persistent):
+
+```bash
+~/.config/hypr/scripts/ravenslide-apply-carousel
+```
+
+3. Run direct panel commands:
 
 ```bash
 RS=~/.config/hypr/scripts/ravenslide
@@ -54,17 +74,51 @@ $RS prev
 $RS list
 ```
 
-2. Move an existing focused window into a panel:
+4. Move an existing focused window into a panel:
 
 ```bash
 $RS adopt
 ```
 
-3. Add temporary keybinds at runtime (not persisted):
+5. Add temporary keybinds at runtime (not persisted):
 
 ```bash
 hyprctl keyword bind "SUPER, bracketright, exec, ~/.config/hypr/scripts/ravenslide next"
 hyprctl keyword bind "SUPER, bracketleft, exec, ~/.config/hypr/scripts/ravenslide prev"
+```
+
+## True Carousel Mode
+
+Carousel mode temporarily moves panel windows into one workspace and arranges them as floating cards with a centered selection.
+
+1. Start carousel:
+
+```bash
+~/.config/hypr/scripts/raven-carousel start
+```
+
+2. Rotate:
+
+```bash
+~/.config/hypr/scripts/raven-carousel next
+~/.config/hypr/scripts/raven-carousel prev
+```
+
+3. Confirm or cancel:
+
+```bash
+~/.config/hypr/scripts/raven-carousel open
+~/.config/hypr/scripts/raven-carousel cancel
+```
+
+4. Optional temporary runtime binds:
+
+```bash
+hyprctl keyword bind "SUPER CTRL, TAB, exec, ~/.config/hypr/scripts/raven-carousel start"
+hyprctl keyword bind "SUPER CTRL, right, exec, ~/.config/hypr/scripts/raven-carousel next"
+hyprctl keyword bind "SUPER CTRL, left, exec, ~/.config/hypr/scripts/raven-carousel prev"
+hyprctl keyword bind "SUPER CTRL, return, exec, ~/.config/hypr/scripts/raven-carousel open"
+hyprctl keyword bind "SUPER CTRL, escape, exec, ~/.config/hypr/scripts/raven-carousel cancel"
 ```
 
 ## Persisting Config (Optional)
@@ -79,6 +133,11 @@ hyprctl configerrors
 
 If something breaks after reload, `hyprctl configerrors` will show the exact bad file and line.
 
+## Animation Notes
+
+- `ravenslide-apply-carousel` tunes normal workspace switching animation.
+- `raven-carousel` is the actual multi-card carousel mode.
+
 ## Default Keybinds (`hypr/ravenslide.conf`)
 
 - `SUPER + ]` -> next panel
@@ -87,6 +146,11 @@ If something breaks after reload, `hyprctl configerrors` will show the exact bad
 - `SUPER + SHIFT + SPACE` -> move active window to next empty panel and fullscreen it
 - `SUPER + ALT + RETURN` -> launch `kitty` in a fresh panel
 - `SUPER + ALT + B` -> launch `firefox` in a fresh panel
+- `SUPER + CTRL + TAB` -> start carousel mode
+- `SUPER + CTRL + right` -> carousel next
+- `SUPER + CTRL + left` -> carousel previous
+- `SUPER + CTRL + RETURN` -> open selected carousel card
+- `SUPER + CTRL + ESCAPE` -> cancel carousel mode
 
 ## CLI
 
@@ -100,11 +164,22 @@ ravenslide list
 ravenslide help
 ```
 
+```bash
+raven-carousel start
+raven-carousel next
+raven-carousel prev
+raven-carousel open
+raven-carousel cancel
+raven-carousel status
+raven-carousel help
+```
+
 ## Environment Variables
 
 - `RAVEN_SLIDE_START` (default `21`)
 - `RAVEN_SLIDE_END` (default `40`)
 - `RAVEN_SLIDE_FULLSCREEN_MODE` (default `1`)
+- `RAVEN_CAROUSEL_WORKSPACE` (default `90`)
 - `HYPRCTL_BIN` (default `hyprctl`)
 
 Set these with `env = ...` in Hyprland if you want a different panel range.

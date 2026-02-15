@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
+
+command -v "$HYPRCTL_BIN" >/dev/null 2>&1 || {
+  echo "ravenslide-apply-carousel: missing command: $HYPRCTL_BIN" >&2
+  exit 1
+}
+
+session_json="$("$HYPRCTL_BIN" activeworkspace -j 2>/dev/null || true)"
+if [[ -z "$session_json" || "${session_json:0:1}" != "{" ]]; then
+  echo "ravenslide-apply-carousel: no active Hyprland JSON session detected" >&2
+  exit 1
+fi
+
+batch_out="$("$HYPRCTL_BIN" --batch "
+keyword bezier ravenCarouselIn,0.22,1,0.36,1;
+keyword bezier ravenCarouselDepth,0.16,1,0.30,1;
+keyword animation workspaces,1,7,ravenCarouselIn,slidefade 12%;
+keyword animation windows,1,6,ravenCarouselDepth,popin 90%;
+keyword animation windowsMove,1,5,ravenCarouselDepth;
+keyword animation fade,1,6,ravenCarouselDepth;
+keyword animation fadeSwitch,1,4,ravenCarouselDepth;
+keyword workspace_swipe true;
+keyword workspace_swipe_forever true
+" 2>&1)" || {
+  echo "ravenslide-apply-carousel: failed to apply preset (are you inside a Hyprland session?)" >&2
+  exit 1
+}
+
+if grep -qi "error" <<<"$batch_out"; then
+  echo "ravenslide-apply-carousel: Hyprland reported an error while applying preset" >&2
+  echo "$batch_out" >&2
+  exit 1
+fi
+
+echo "Applied RavenSlide carousel runtime preset (non-persistent)."
+echo "Run: hyprctl configerrors  # to inspect any config/runtime parse errors"
