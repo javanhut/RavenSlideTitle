@@ -20,6 +20,26 @@ RavenSlide gives Hyprland a fullscreen panel workflow: each app can live on its 
 
 ## Install
 
+Quick path with `make`:
+
+```bash
+make install
+make ensure-source
+```
+
+Then test without reload:
+
+```bash
+make apply-carousel
+make panel CMD='launch kitty'
+make panel CMD='launch firefox'
+make carousel CMD='start'
+make carousel CMD='next'
+make carousel CMD='open'
+```
+
+Manual path:
+
 1. Install the scripts:
 
 ```bash
@@ -183,3 +203,23 @@ raven-carousel help
 - `HYPRCTL_BIN` (default `hyprctl`)
 
 Set these with `env = ...` in Hyprland if you want a different panel range.
+
+## Make Targets
+
+```bash
+make help
+make install
+make update
+make ensure-source
+make validate
+make apply-carousel
+make panel CMD='next'
+make panel CMD='launch kitty'
+make carousel CMD='start'
+make carousel CMD='next'
+make carousel CMD='prev'
+make carousel CMD='open'
+make carousel CMD='cancel'
+make runtime-binds
+make reload-config
+```
