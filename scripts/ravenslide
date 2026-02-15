@@ -1,37 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RAVEN_SLIDE_START="${RAVEN_SLIDE_START:-21}"
-RAVEN_SLIDE_END="${RAVEN_SLIDE_END:-40}"
-RAVEN_SLIDE_FULLSCREEN_MODE="${RAVEN_SLIDE_FULLSCREEN_MODE:-1}"
-HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
+_RAVEN_PROG="ravenslide"
 
-die() {
-  echo "ravenslide: $*" >&2
-  exit 1
-}
+# Source shared library (look next to this script, then in PATH)
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_LIB_DIR/ravenslide-lib" ]]; then
+  # shellcheck source=ravenslide-lib
+  source "$_LIB_DIR/ravenslide-lib"
+else
+  # shellcheck source=ravenslide-lib
+  source ravenslide-lib 2>/dev/null || { echo "ravenslide: cannot find ravenslide-lib" >&2; exit 1; }
+fi
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
-}
-
-validate_range() {
-  [[ "$RAVEN_SLIDE_START" =~ ^[0-9]+$ ]] || die "RAVEN_SLIDE_START must be a positive integer"
-  [[ "$RAVEN_SLIDE_END" =~ ^[0-9]+$ ]] || die "RAVEN_SLIDE_END must be a positive integer"
-  (( RAVEN_SLIDE_START <= RAVEN_SLIDE_END )) || die "RAVEN_SLIDE_START must be <= RAVEN_SLIDE_END"
-}
-
-hypr_json() {
-  local target="$1"
-  local out
-  if ! out="$("$HYPRCTL_BIN" "$target" -j 2>/dev/null)"; then
-    die "failed to query hyprctl '$target' (are you inside a Hyprland session?)"
-  fi
-  if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
-    die "hyprctl returned invalid JSON for '$target' (are you inside a Hyprland session?)"
-  fi
-  printf '%s\n' "$out"
-}
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
 
 active_workspace_id() {
   hypr_json activeworkspace | jq -r '.id'
@@ -70,6 +54,10 @@ next_free_panel_id() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Action helpers
+# ---------------------------------------------------------------------------
+
 switch_workspace() {
   local ws="$1"
   "$HYPRCTL_BIN" dispatch workspace "$ws" >/dev/null
@@ -81,12 +69,17 @@ move_active_to_workspace() {
 }
 
 ensure_active_fullscreen() {
+  hypr_json_flush
   local is_fs
   is_fs="$(active_window_is_fullscreen)"
   if [[ "$is_fs" != "true" && "$is_fs" != "1" ]]; then
     "$HYPRCTL_BIN" dispatch fullscreen "$RAVEN_SLIDE_FULLSCREEN_MODE" >/dev/null
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 cmd_new() {
   local ws
@@ -116,7 +109,134 @@ cmd_launch() {
   switch_workspace "$ws"
   "$@" >/dev/null 2>&1 &
   disown || true
-  echo "launched workspace:$ws cmd:$*"
+
+  # Poll for the new window to appear, then fullscreen it
+  local waited=0
+  while (( waited < 50 )); do
+    sleep 0.1
+    hypr_json_flush
+    local win_addr
+    win_addr="$(active_window_addr)" || true
+    if [[ -n "$win_addr" && "$win_addr" != "null" ]]; then
+      ensure_active_fullscreen
+      echo "launched workspace:$ws cmd:$*"
+      return 0
+    fi
+    (( waited++ ))
+  done
+
+  # Window didn't appear in time, still report success for the launch itself
+  echo "launched workspace:$ws cmd:$* (window not yet detected)"
+}
+
+cmd_close() {
+  local current
+  current="$(active_workspace_id)"
+
+  # Only act if we're on a panel workspace
+  if (( current < RAVEN_SLIDE_START || current > RAVEN_SLIDE_END )); then
+    die "not on a panel workspace (current: $current)"
+  fi
+
+  # Close the active window
+  local addr
+  addr="$(active_window_addr)"
+  if [[ -n "$addr" && "$addr" != "null" ]]; then
+    "$HYPRCTL_BIN" dispatch closewindow "address:$addr" >/dev/null
+  fi
+
+  # Brief pause for Hyprland to process the close
+  sleep 0.1
+  hypr_json_flush
+
+  # Navigate to nearest occupied panel
+  mapfile -t ids < <(occupied_panel_ids)
+  if (( ${#ids[@]} == 0 )); then
+    echo "closed:$current (no panels remaining)"
+    return 0
+  fi
+
+  # Find nearest panel
+  local best="${ids[0]}"
+  local best_dist=$(( current - ids[0] ))
+  (( best_dist < 0 )) && best_dist=$(( -best_dist ))
+
+  local id dist
+  for id in "${ids[@]}"; do
+    dist=$(( current - id ))
+    (( dist < 0 )) && dist=$(( -dist ))
+    if (( dist < best_dist )); then
+      best="$id"
+      best_dist="$dist"
+    fi
+  done
+
+  switch_workspace "$best"
+  echo "closed:$current -> workspace:$best"
+}
+
+cmd_goto() {
+  (( $# > 0 )) || die "goto requires a workspace ID, e.g. ravenslide goto 23"
+  local target="$1"
+  validate_int "workspace ID" "$target"
+  if (( target < RAVEN_SLIDE_START || target > RAVEN_SLIDE_END )); then
+    die "workspace $target is outside panel range ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+  fi
+  switch_workspace "$target"
+  echo "workspace:$target"
+}
+
+cmd_swap() {
+  local direction="${1:-}"
+  [[ "$direction" == "next" || "$direction" == "prev" ]] || die "swap requires 'next' or 'prev'"
+
+  local current
+  current="$(active_workspace_id)"
+  if (( current < RAVEN_SLIDE_START || current > RAVEN_SLIDE_END )); then
+    die "not on a panel workspace (current: $current)"
+  fi
+
+  mapfile -t ids < <(occupied_panel_ids)
+  (( ${#ids[@]} > 1 )) || die "need at least 2 occupied panels to swap"
+
+  # Find current position
+  local idx=-1 i
+  for i in "${!ids[@]}"; do
+    if [[ "${ids[$i]}" == "$current" ]]; then
+      idx="$i"
+      break
+    fi
+  done
+  (( idx != -1 )) || die "current workspace $current not in occupied panel list"
+
+  # Determine target
+  local target_idx
+  if [[ "$direction" == "next" ]]; then
+    target_idx=$(( (idx + 1) % ${#ids[@]} ))
+  else
+    target_idx=$(( (idx - 1 + ${#ids[@]}) % ${#ids[@]} ))
+  fi
+  local target_ws="${ids[$target_idx]}"
+
+  # Get window addresses on each workspace
+  local current_addr target_addr
+  current_addr="$(hypr_json clients | jq -r --argjson ws "$current" '
+    [.[] | select(.workspace.id == $ws)][0].address // empty
+  ')"
+  target_addr="$(hypr_json clients | jq -r --argjson ws "$target_ws" '
+    [.[] | select(.workspace.id == $ws)][0].address // empty
+  ')"
+
+  [[ -n "$current_addr" ]] || die "no window on current panel $current"
+  [[ -n "$target_addr" ]] || die "no window on target panel $target_ws"
+
+  # Batch swap: move both windows simultaneously
+  "$HYPRCTL_BIN" --batch "
+    dispatch movetoworkspacesilent $target_ws,address:$current_addr;
+    dispatch movetoworkspacesilent $current,address:$target_addr
+  " >/dev/null
+
+  echo "swapped:$current<->$target_ws"
 }
 
 cmd_cycle() {
@@ -159,14 +279,30 @@ cmd_list() {
   local current
   current="$(active_workspace_id)"
 
+  # Header
+  printf '%-4s  %-6s  %-40s\n' "ID" "WINS" "TITLE"
+  printf '%-4s  %-6s  %-40s\n' "----" "------" "----------------------------------------"
+
   hypr_json workspaces \
     | jq -r --argjson s "$RAVEN_SLIDE_START" --argjson e "$RAVEN_SLIDE_END" --argjson c "$current" '
       .[]
       | select(.id >= $s and .id <= $e and .windows > 0)
-      | "\(.id)\t\(.windows)\t\(.lastwindowtitle // "-")\t" + (if .id == $c then "*" else "" end)
+      | [.id, .windows, (.lastwindowtitle // "-"), (if .id == $c then "*" else "" end)]
+      | @tsv
     ' \
-    | sort -n
+    | sort -n \
+    | while IFS=$'\t' read -r id wins title marker; do
+        if [[ -n "$marker" ]]; then
+          printf '%-4s  %-6s  %-40s %s\n' "$id" "$wins" "$title" "$marker"
+        else
+          printf '%-4s  %-6s  %-40s\n' "$id" "$wins" "$title"
+        fi
+      done
 }
+
+# ---------------------------------------------------------------------------
+# Help & main
+# ---------------------------------------------------------------------------
 
 print_help() {
   cat <<EOF
@@ -178,6 +314,9 @@ Usage:
   ravenslide launch <cmd...>  Switch to next empty panel and launch a command there
   ravenslide next             Slide to next occupied panel workspace
   ravenslide prev             Slide to previous occupied panel workspace
+  ravenslide close            Close current panel window, slide to nearest panel
+  ravenslide goto <id>        Jump directly to a panel workspace by ID
+  ravenslide swap next|prev   Swap current panel's window with adjacent panel
   ravenslide list             List occupied panel workspaces
   ravenslide help             Show this help
 
@@ -217,6 +356,15 @@ main() {
       ;;
     prev)
       cmd_cycle prev
+      ;;
+    close)
+      cmd_close
+      ;;
+    goto)
+      cmd_goto "$@"
+      ;;
+    swap)
+      cmd_swap "$@"
       ;;
     list)
       cmd_list

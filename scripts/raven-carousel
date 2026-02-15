@@ -1,45 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
-RAVEN_SLIDE_START="${RAVEN_SLIDE_START:-21}"
-RAVEN_SLIDE_END="${RAVEN_SLIDE_END:-40}"
-RAVEN_CAROUSEL_WORKSPACE="${RAVEN_CAROUSEL_WORKSPACE:-90}"
+_RAVEN_PROG="raven-carousel"
+
+# Source shared library (look next to this script, then in PATH)
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_LIB_DIR/ravenslide-lib" ]]; then
+  # shellcheck source=ravenslide-lib
+  source "$_LIB_DIR/ravenslide-lib"
+else
+  # shellcheck source=ravenslide-lib
+  source ravenslide-lib 2>/dev/null || { echo "raven-carousel: cannot find ravenslide-lib" >&2; exit 1; }
+fi
+
 STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/ravenslide-carousel-${HYPRLAND_INSTANCE_SIGNATURE:-default}.json"
 
-die() {
-  echo "raven-carousel: $*" >&2
-  exit 1
+# ---------------------------------------------------------------------------
+# Opacity table by distance from selected card
+# ---------------------------------------------------------------------------
+#   distance 0 (selected): 1.0
+#   distance 1:            0.85
+#   distance 2:            0.65
+#   distance 3+:           0.50
+
+opacity_for_distance() {
+  local dist="$1"
+  case "$dist" in
+    0) echo "1.0" ;;
+    1) echo "0.85" ;;
+    2) echo "0.65" ;;
+    *) echo "0.50" ;;
+  esac
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
-}
-
-validate_int() {
-  local name="$1"
-  local value="$2"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a positive integer"
-}
-
-hypr_json() {
-  local target="$1"
-  local out
-  if ! out="$("$HYPRCTL_BIN" "$target" -j 2>/dev/null)"; then
-    die "failed to query hyprctl '$target' (are you inside a Hyprland session?)"
-  fi
-  if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
-    die "hyprctl returned invalid JSON for '$target' (are you inside a Hyprland session?)"
-  fi
-  printf '%s\n' "$out"
-}
-
-dispatch() {
-  local name="$1"
-  shift
-  local args="$*"
-  "$HYPRCTL_BIN" dispatch "$name" "$args" >/dev/null
-}
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
 
 state_exists() {
   [[ -s "$STATE_FILE" ]]
@@ -60,6 +56,28 @@ write_state() {
 clear_state() {
   rm -f "$STATE_FILE"
 }
+
+# Check for stale state (no windows remaining on carousel workspace)
+check_stale_state() {
+  if ! state_exists; then
+    return 0
+  fi
+  local carousel_ws
+  carousel_ws="$(jq -r '.carousel_workspace' "$STATE_FILE")"
+  local count
+  count="$("$HYPRCTL_BIN" clients -j 2>/dev/null | jq --argjson ws "$carousel_ws" '
+    [.[] | select(.workspace.id == $ws)] | length
+  ')"
+  if (( count == 0 )); then
+    clear_state
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Window queries
+# ---------------------------------------------------------------------------
 
 panel_windows_json() {
   hypr_json clients \
@@ -92,6 +110,10 @@ focused_monitor_box() {
     '
 }
 
+# ---------------------------------------------------------------------------
+# Layout: batch all IPC into a single --batch call
+# ---------------------------------------------------------------------------
+
 apply_layout() {
   local state
   state="$(read_state)"
@@ -100,9 +122,6 @@ apply_layout() {
   active_ws="$(hypr_json activeworkspace | jq -r '.id')"
   local carousel_ws
   carousel_ws="$(jq -r '.carousel_workspace' <<<"$state")"
-  if [[ "$active_ws" != "$carousel_ws" ]]; then
-    dispatch workspace "$carousel_ws"
-  fi
 
   local monitor_box
   monitor_box="$(focused_monitor_box)"
@@ -124,10 +143,12 @@ apply_layout() {
   local max_x=$((mx + mw - margin_x))
   local max_y=$((my + mh - margin_y))
 
-  local i
+  # Build a single batch string for all layout operations
+  local batch=""
   local selected_addr="${addresses[$selected]}"
-  local sel_w=0 sel_h=0 sel_x=0 sel_y=0
+  local sel_w=0 sel_h=0 sel_x=0 sel_y=0 sel_opacity="1.0"
 
+  local i
   for i in "${!addresses[@]}"; do
     local addr="${addresses[$i]}"
     local delta=$((i - selected))
@@ -163,37 +184,46 @@ apply_layout() {
     x=$((mx + (mw - ww) / 2 + xoff))
     y=$((my + (mh - wh) / 2 + yoff))
 
-    # Clamp to monitor so the card never overlaps into other monitors/areas.
-    if (( x < min_x )); then
-      x="$min_x"
-    fi
-    if (( y < min_y )); then
-      y="$min_y"
-    fi
-    if (( x + ww > max_x )); then
-      x=$((max_x - ww))
-    fi
-    if (( y + wh > max_y )); then
-      y=$((max_y - wh))
-    fi
+    # Clamp to monitor
+    (( x < min_x )) && x="$min_x"
+    (( y < min_y )) && y="$min_y"
+    (( x + ww > max_x )) && x=$((max_x - ww))
+    (( y + wh > max_y )) && y=$((max_y - wh))
+
+    local opacity
+    opacity="$(opacity_for_distance "$absd")"
 
     if [[ "$addr" == "$selected_addr" ]]; then
       sel_w="$ww"
       sel_h="$wh"
       sel_x="$x"
       sel_y="$y"
+      sel_opacity="$opacity"
     else
-      dispatch resizewindowpixel "exact $ww $wh,address:$addr"
-      dispatch movewindowpixel "exact $x $y,address:$addr"
+      batch+="dispatch resizewindowpixel exact $ww $wh,address:$addr;"
+      batch+="dispatch movewindowpixel exact $x $y,address:$addr;"
+      batch+="dispatch setprop address:$addr alpha $opacity locked;"
     fi
   done
 
-  # Lay out selected card last so it is above other floating cards.
-  dispatch resizewindowpixel "exact $sel_w $sel_h,address:$selected_addr"
-  dispatch movewindowpixel "exact $sel_x $sel_y,address:$selected_addr"
-  dispatch focuswindow "address:$selected_addr"
-  "$HYPRCTL_BIN" dispatch bringactivetotop "" >/dev/null 2>&1 || true
+  # Selected card last so it renders on top
+  batch+="dispatch resizewindowpixel exact $sel_w $sel_h,address:$selected_addr;"
+  batch+="dispatch movewindowpixel exact $sel_x $sel_y,address:$selected_addr;"
+  batch+="dispatch setprop address:$selected_addr alpha $sel_opacity locked;"
+  batch+="dispatch focuswindow address:$selected_addr;"
+  batch+="dispatch bringactivetotop ;"
+
+  # Switch workspace first if needed, then apply all layout in one batch
+  if [[ "$active_ws" != "$carousel_ws" ]]; then
+    batch="dispatch workspace $carousel_ws;$batch"
+  fi
+
+  "$HYPRCTL_BIN" --batch "$batch" >/dev/null 2>&1
 }
+
+# ---------------------------------------------------------------------------
+# Restore: batch all IPC into a single --batch call
+# ---------------------------------------------------------------------------
 
 restore_windows() {
   local mode="$1"
@@ -207,31 +237,60 @@ restore_windows() {
   local previous_ws
   previous_ws="$(jq -r '.active_workspace_before' <<<"$state")"
 
+  local batch=""
+
   while IFS= read -r row; do
     local addr ws was_floating
     addr="$(jq -r '.address' <<<"$row")"
     ws="$(jq -r '.workspace' <<<"$row")"
     was_floating="$(jq -r '.floating' <<<"$row")"
 
-    dispatch movetoworkspacesilent "$ws,address:$addr"
+    batch+="dispatch movetoworkspacesilent $ws,address:$addr;"
+    # Reset opacity back to full
+    batch+="dispatch setprop address:$addr alpha 1.0 locked;"
     if [[ "$was_floating" == "true" ]]; then
-      dispatch setfloating "address:$addr"
+      batch+="dispatch setfloating address:$addr;"
     else
-      dispatch settiled "address:$addr"
+      batch+="dispatch settiled address:$addr;"
     fi
   done < <(jq -c '.windows[]' <<<"$state")
 
   if [[ "$mode" == "open" ]]; then
-    dispatch workspace "$selected_ws"
-    dispatch focuswindow "address:$selected_addr"
-    dispatch fullscreen "1 set"
+    batch+="dispatch workspace $selected_ws;"
+    batch+="dispatch focuswindow address:$selected_addr;"
+    batch+="dispatch fullscreen 1 set;"
   else
-    dispatch workspace "$previous_ws"
+    batch+="dispatch workspace $previous_ws;"
+  fi
+
+  "$HYPRCTL_BIN" --batch "$batch" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Signal handling for safe cleanup
+# ---------------------------------------------------------------------------
+
+_carousel_cleanup() {
+  if state_exists; then
+    restore_windows cancel 2>/dev/null || true
+    clear_state
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
 cmd_start() {
-  state_exists && die "carousel already active"
+  # Check for stale state first
+  if state_exists; then
+    if ! check_stale_state; then
+      # State was stale and has been cleaned up, proceed
+      :
+    else
+      die "carousel already active"
+    fi
+  fi
 
   local windows_json
   windows_json="$(panel_windows_json)"
@@ -261,14 +320,24 @@ cmd_start() {
   )"
   write_state "$state"
 
-  while IFS= read -r addr; do
-    dispatch movetoworkspacesilent "$RAVEN_CAROUSEL_WORKSPACE,address:$addr"
-    dispatch setfloating "address:$addr"
-    dispatch focuswindow "address:$addr"
-    dispatch fullscreen "0 unset" || true
-  done < <(jq -r '.windows[].address' <<<"$state")
+  # Install signal handler for cleanup
+  trap _carousel_cleanup EXIT SIGINT SIGTERM
 
-  dispatch workspace "$RAVEN_CAROUSEL_WORKSPACE"
+  # Batch: move all windows to carousel workspace + set floating + unset fullscreen
+  local batch=""
+  while IFS= read -r addr; do
+    batch+="dispatch movetoworkspacesilent $RAVEN_CAROUSEL_WORKSPACE,address:$addr;"
+    batch+="dispatch setfloating address:$addr;"
+    batch+="dispatch focuswindow address:$addr;"
+    batch+="dispatch fullscreen 0 unset;"
+  done < <(jq -r '.windows[].address' <<<"$state")
+  batch+="dispatch workspace $RAVEN_CAROUSEL_WORKSPACE;"
+
+  "$HYPRCTL_BIN" --batch "$batch" >/dev/null 2>&1
+
+  # Disable cleanup trap since we successfully started - layout will handle things
+  trap - EXIT SIGINT SIGTERM
+
   apply_layout
   echo "started:$count workspace:$RAVEN_CAROUSEL_WORKSPACE"
 }
@@ -320,6 +389,10 @@ cmd_status() {
     echo "inactive state:$STATE_FILE"
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Help & main
+# ---------------------------------------------------------------------------
 
 print_help() {
   cat <<EOF

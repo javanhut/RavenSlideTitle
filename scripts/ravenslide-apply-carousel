@@ -22,8 +22,8 @@ keyword animation windows,1,6,ravenCarouselDepth,popin 90%;
 keyword animation windowsMove,1,5,ravenCarouselDepth;
 keyword animation fade,1,6,ravenCarouselDepth;
 keyword animation fadeSwitch,1,4,ravenCarouselDepth;
-keyword workspace_swipe true;
-keyword workspace_swipe_forever true
+keyword gestures:workspace_swipe true;
+keyword gestures:workspace_swipe_forever true
 " 2>&1)" || {
   echo "ravenslide-apply-carousel: failed to apply preset (are you inside a Hyprland session?)" >&2
   exit 1

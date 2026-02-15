@@ -6,20 +6,23 @@ CONFIG_DEST ?= $(CONFIG_HOME)/ravenslide.conf
 HYPRLAND_MAIN ?= $(CONFIG_HOME)/hyprland.conf
 
 RAVENSLIDE_SRC := scripts/ravenslide
+RAVEN_LIB_SRC := scripts/ravenslide-lib
 RAVEN_APPLY_SRC := scripts/ravenslide-apply-carousel
 RAVEN_CAROUSEL_SRC := scripts/raven-carousel
 RAVEN_CONF_SRC := hypr/ravenslide.conf
 
 RAVENSLIDE := $(SCRIPTS_DEST)/ravenslide
+RAVEN_LIB := $(SCRIPTS_DEST)/ravenslide-lib
 RAVEN_APPLY := $(SCRIPTS_DEST)/ravenslide-apply-carousel
 RAVEN_CAROUSEL := $(SCRIPTS_DEST)/raven-carousel
 
 .DEFAULT_GOAL := help
 
 .PHONY: help install update install-scripts install-config ensure-source \
-	validate test apply-carousel panel carousel panel-next panel-prev \
+	uninstall validate test apply-carousel \
+	panel carousel panel-next panel-prev panel-close panel-goto \
 	carousel-start carousel-next carousel-prev carousel-open carousel-cancel \
-	status runtime-binds reload-config
+	carousel-toggle status runtime-binds reload-config
 
 help:
 	@echo "RavenSlide Make targets"
@@ -28,6 +31,7 @@ help:
 	@echo "  make install            Copy scripts + config into ~/.config/hypr"
 	@echo "  make update             Same as install"
 	@echo "  make ensure-source      Ensure hyprland.conf sources ravenslide.conf"
+	@echo "  make uninstall          Remove installed scripts, config, and source line"
 	@echo
 	@echo "Validation:"
 	@echo "  make validate           Syntax-check scripts and print help output"
@@ -37,8 +41,10 @@ help:
 	@echo "  make apply-carousel     Apply runtime animation preset"
 	@echo "  make panel CMD='next'   Run ravenslide command"
 	@echo "  make carousel CMD='start' Run raven-carousel command"
-	@echo "  make panel-next | panel-prev"
+	@echo "  make panel-next | panel-prev | panel-close"
+	@echo "  make panel-goto ID=23"
 	@echo "  make carousel-start | carousel-next | carousel-prev | carousel-open | carousel-cancel"
+	@echo "  make carousel-toggle"
 	@echo "  make status             Show status for both tools"
 	@echo
 	@echo "Hyprland runtime helpers:"
@@ -58,9 +64,10 @@ update: install
 install-scripts:
 	@mkdir -p "$(SCRIPTS_DEST)"
 	@cp "$(RAVENSLIDE_SRC)" "$(RAVENSLIDE)"
+	@cp "$(RAVEN_LIB_SRC)" "$(RAVEN_LIB)"
 	@cp "$(RAVEN_APPLY_SRC)" "$(RAVEN_APPLY)"
 	@cp "$(RAVEN_CAROUSEL_SRC)" "$(RAVEN_CAROUSEL)"
-	@chmod +x "$(RAVENSLIDE)" "$(RAVEN_APPLY)" "$(RAVEN_CAROUSEL)"
+	@chmod +x "$(RAVENSLIDE)" "$(RAVEN_LIB)" "$(RAVEN_APPLY)" "$(RAVEN_CAROUSEL)"
 	@echo "Installed scripts into $(SCRIPTS_DEST)"
 
 install-config:
@@ -78,7 +85,18 @@ ensure-source:
 		echo "Source line already present in $(HYPRLAND_MAIN)"; \
 	fi
 
+uninstall:
+	@rm -f "$(RAVENSLIDE)" "$(RAVEN_LIB)" "$(RAVEN_APPLY)" "$(RAVEN_CAROUSEL)"
+	@echo "Removed scripts from $(SCRIPTS_DEST)"
+	@rm -f "$(CONFIG_DEST)"
+	@echo "Removed config $(CONFIG_DEST)"
+	@if [[ -f "$(HYPRLAND_MAIN)" ]]; then \
+		sed -i '\|^source = $(CONFIG_DEST)$$|d' "$(HYPRLAND_MAIN)" 2>/dev/null || true; \
+		echo "Removed source line from $(HYPRLAND_MAIN)"; \
+	fi
+
 validate:
+	@bash -n "$(RAVEN_LIB_SRC)"
 	@bash -n "$(RAVENSLIDE_SRC)"
 	@bash -n "$(RAVEN_APPLY_SRC)"
 	@bash -n "$(RAVEN_CAROUSEL_SRC)"
@@ -107,6 +125,14 @@ panel-next:
 panel-prev:
 	@"$(RAVENSLIDE)" prev
 
+panel-close:
+	@"$(RAVENSLIDE)" close
+
+panel-goto:
+	@id='$(ID)'; \
+	if [[ -z "$$id" ]]; then echo "Usage: make panel-goto ID=<workspace-id>"; exit 1; fi; \
+	"$(RAVENSLIDE)" goto "$$id"
+
 carousel-start:
 	@"$(RAVEN_CAROUSEL)" start
 
@@ -122,6 +148,9 @@ carousel-open:
 carousel-cancel:
 	@"$(RAVEN_CAROUSEL)" cancel
 
+carousel-toggle:
+	@"$(RAVEN_CAROUSEL)" toggle
+
 status:
 	@echo "ravenslide list:"
 	@"$(RAVENSLIDE)" list || true
@@ -132,7 +161,10 @@ status:
 runtime-binds:
 	@hyprctl keyword bind "SUPER, bracketright, exec, $(RAVENSLIDE) next"
 	@hyprctl keyword bind "SUPER, bracketleft, exec, $(RAVENSLIDE) prev"
-	@hyprctl keyword bind "SUPER CTRL, TAB, exec, $(RAVEN_CAROUSEL) start"
+	@hyprctl keyword bind "SUPER SHIFT, Q, exec, $(RAVENSLIDE) close"
+	@hyprctl keyword bind "SUPER SHIFT, bracketright, exec, $(RAVENSLIDE) swap next"
+	@hyprctl keyword bind "SUPER SHIFT, bracketleft, exec, $(RAVENSLIDE) swap prev"
+	@hyprctl keyword bind "SUPER CTRL, TAB, exec, $(RAVEN_CAROUSEL) toggle"
 	@hyprctl keyword bind "SUPER CTRL, right, exec, $(RAVEN_CAROUSEL) next"
 	@hyprctl keyword bind "SUPER CTRL, left, exec, $(RAVEN_CAROUSEL) prev"
 	@hyprctl keyword bind "SUPER CTRL, return, exec, $(RAVEN_CAROUSEL) open"

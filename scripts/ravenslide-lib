@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# ravenslide-lib: shared function library for RavenSlide scripts
+# Source this file, do not execute it directly.
+
+# Guard against double-sourcing
+[[ -n "${_RAVENSLIDE_LIB_LOADED:-}" ]] && return 0
+_RAVENSLIDE_LIB_LOADED=1
+
+# Per-script error prefix (set before sourcing, or defaults to "ravenslide")
+_RAVEN_PROG="${_RAVEN_PROG:-ravenslide}"
+
+# Shared defaults
+HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
+RAVEN_SLIDE_START="${RAVEN_SLIDE_START:-21}"
+RAVEN_SLIDE_END="${RAVEN_SLIDE_END:-40}"
+RAVEN_SLIDE_FULLSCREEN_MODE="${RAVEN_SLIDE_FULLSCREEN_MODE:-1}"
+RAVEN_CAROUSEL_WORKSPACE="${RAVEN_CAROUSEL_WORKSPACE:-90}"
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() {
+  echo "${_RAVEN_PROG}: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+validate_int() {
+  local name="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a positive integer"
+}
+
+validate_range() {
+  validate_int RAVEN_SLIDE_START "$RAVEN_SLIDE_START"
+  validate_int RAVEN_SLIDE_END "$RAVEN_SLIDE_END"
+  (( RAVEN_SLIDE_START <= RAVEN_SLIDE_END )) || die "RAVEN_SLIDE_START must be <= RAVEN_SLIDE_END"
+}
+
+# ---------------------------------------------------------------------------
+# hypr_json with per-invocation cache
+# ---------------------------------------------------------------------------
+
+declare -gA _HYPR_JSON_CACHE=()
+
+hypr_json() {
+  local target="$1"
+  if [[ -n "${_HYPR_JSON_CACHE[$target]+x}" ]]; then
+    printf '%s\n' "${_HYPR_JSON_CACHE[$target]}"
+    return 0
+  fi
+  local out
+  if ! out="$("$HYPRCTL_BIN" "$target" -j 2>/dev/null)"; then
+    die "failed to query hyprctl '$target' (are you inside a Hyprland session?)"
+  fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+    die "hyprctl returned invalid JSON for '$target' (are you inside a Hyprland session?)"
+  fi
+  _HYPR_JSON_CACHE[$target]="$out"
+  printf '%s\n' "$out"
+}
+
+# Invalidate all cached hyprctl queries (call after dispatches that change state)
+hypr_json_flush() {
+  _HYPR_JSON_CACHE=()
+}
+
+# ---------------------------------------------------------------------------
+# Hyprland dispatch helpers
+# ---------------------------------------------------------------------------
+
+dispatch() {
+  local name="$1"
+  shift
+  local args="$*"
+  "$HYPRCTL_BIN" dispatch "$name" "$args" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Notifications (best-effort, silent if notify-send unavailable)
+# ---------------------------------------------------------------------------
+
+notify() {
+  local summary="$1"
+  local body="${2:-}"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "$_RAVEN_PROG" "$summary" "$body" 2>/dev/null || true
+  fi
+}
