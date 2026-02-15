@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RAVEN_SLIDE_START="${RAVEN_SLIDE_START:-21}"
+RAVEN_SLIDE_END="${RAVEN_SLIDE_END:-40}"
+RAVEN_SLIDE_FULLSCREEN_MODE="${RAVEN_SLIDE_FULLSCREEN_MODE:-1}"
+HYPRCTL_BIN="${HYPRCTL_BIN:-hyprctl}"
+
+die() {
+  echo "ravenslide: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+validate_range() {
+  [[ "$RAVEN_SLIDE_START" =~ ^[0-9]+$ ]] || die "RAVEN_SLIDE_START must be a positive integer"
+  [[ "$RAVEN_SLIDE_END" =~ ^[0-9]+$ ]] || die "RAVEN_SLIDE_END must be a positive integer"
+  (( RAVEN_SLIDE_START <= RAVEN_SLIDE_END )) || die "RAVEN_SLIDE_START must be <= RAVEN_SLIDE_END"
+}
+
+hypr_json() {
+  local target="$1"
+  local out
+  if ! out="$("$HYPRCTL_BIN" "$target" -j 2>/dev/null)"; then
+    die "failed to query hyprctl '$target' (are you inside a Hyprland session?)"
+  fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+    die "hyprctl returned invalid JSON for '$target' (are you inside a Hyprland session?)"
+  fi
+  printf '%s\n' "$out"
+}
+
+active_workspace_id() {
+  hypr_json activeworkspace | jq -r '.id'
+}
+
+active_window_addr() {
+  hypr_json activewindow | jq -r '.address // empty'
+}
+
+active_window_is_fullscreen() {
+  hypr_json activewindow | jq -r '.fullscreen // false'
+}
+
+occupied_panel_ids() {
+  hypr_json workspaces \
+    | jq -r --argjson s "$RAVEN_SLIDE_START" --argjson e "$RAVEN_SLIDE_END" '
+      .[]
+      | select(.id >= $s and .id <= $e and .windows > 0)
+      | .id
+    ' \
+    | sort -n
+}
+
+next_free_panel_id() {
+  local used
+  used="$(occupied_panel_ids)"
+
+  local id
+  for ((id = RAVEN_SLIDE_START; id <= RAVEN_SLIDE_END; id++)); do
+    if ! grep -qx "$id" <<<"$used"; then
+      echo "$id"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+switch_workspace() {
+  local ws="$1"
+  "$HYPRCTL_BIN" dispatch workspace "$ws" >/dev/null
+}
+
+move_active_to_workspace() {
+  local ws="$1"
+  "$HYPRCTL_BIN" dispatch movetoworkspacesilent "$ws" >/dev/null
+}
+
+ensure_active_fullscreen() {
+  local is_fs
+  is_fs="$(active_window_is_fullscreen)"
+  if [[ "$is_fs" != "true" && "$is_fs" != "1" ]]; then
+    "$HYPRCTL_BIN" dispatch fullscreen "$RAVEN_SLIDE_FULLSCREEN_MODE" >/dev/null
+  fi
+}
+
+cmd_new() {
+  local ws
+  ws="$(next_free_panel_id)" || die "no free panel workspace left in ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+  switch_workspace "$ws"
+  echo "workspace:$ws"
+}
+
+cmd_adopt() {
+  local addr
+  addr="$(active_window_addr)"
+  [[ -n "$addr" && "$addr" != "null" ]] || die "no active window"
+
+  local ws
+  ws="$(next_free_panel_id)" || die "no free panel workspace left in ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+
+  move_active_to_workspace "$ws"
+  switch_workspace "$ws"
+  ensure_active_fullscreen
+  echo "moved:$addr workspace:$ws"
+}
+
+cmd_launch() {
+  (( $# > 0 )) || die "launch requires a command, e.g. ravenslide launch kitty"
+  local ws
+  ws="$(next_free_panel_id)" || die "no free panel workspace left in ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+  switch_workspace "$ws"
+  "$@" >/dev/null 2>&1 &
+  disown || true
+  echo "launched workspace:$ws cmd:$*"
+}
+
+cmd_cycle() {
+  local direction="$1"
+  mapfile -t ids < <(occupied_panel_ids)
+  (( ${#ids[@]} > 0 )) || die "no occupied panel workspaces in ${RAVEN_SLIDE_START}-${RAVEN_SLIDE_END}"
+
+  local current
+  current="$(active_workspace_id)"
+
+  local idx=-1
+  local i
+  for i in "${!ids[@]}"; do
+    if [[ "${ids[$i]}" == "$current" ]]; then
+      idx="$i"
+      break
+    fi
+  done
+
+  local target
+  if (( idx == -1 )); then
+    if [[ "$direction" == "next" ]]; then
+      target="${ids[0]}"
+    else
+      target="${ids[${#ids[@]}-1]}"
+    fi
+  else
+    if [[ "$direction" == "next" ]]; then
+      target="${ids[$(((idx + 1) % ${#ids[@]}))]}"
+    else
+      target="${ids[$(((idx - 1 + ${#ids[@]}) % ${#ids[@]}))]}"
+    fi
+  fi
+
+  switch_workspace "$target"
+  echo "workspace:$target"
+}
+
+cmd_list() {
+  local current
+  current="$(active_workspace_id)"
+
+  hypr_json workspaces \
+    | jq -r --argjson s "$RAVEN_SLIDE_START" --argjson e "$RAVEN_SLIDE_END" --argjson c "$current" '
+      .[]
+      | select(.id >= $s and .id <= $e and .windows > 0)
+      | "\(.id)\t\(.windows)\t\(.lastwindowtitle // "-")\t" + (if .id == $c then "*" else "" end)
+    ' \
+    | sort -n
+}
+
+print_help() {
+  cat <<EOF
+ravenslide: workspace-panel helper for Hyprland
+
+Usage:
+  ravenslide new              Switch to the next empty panel workspace
+  ravenslide adopt            Move active window to next empty panel + fullscreen it
+  ravenslide launch <cmd...>  Switch to next empty panel and launch a command there
+  ravenslide next             Slide to next occupied panel workspace
+  ravenslide prev             Slide to previous occupied panel workspace
+  ravenslide list             List occupied panel workspaces
+  ravenslide help             Show this help
+
+Environment:
+  RAVEN_SLIDE_START (default: 21)
+  RAVEN_SLIDE_END   (default: 40)
+  RAVEN_SLIDE_FULLSCREEN_MODE (default: 1)
+  HYPRCTL_BIN (default: hyprctl)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+    print_help
+    return 0
+  fi
+
+  need_cmd "$HYPRCTL_BIN"
+  need_cmd jq
+  validate_range
+
+  case "$cmd" in
+    new)
+      cmd_new
+      ;;
+    adopt)
+      cmd_adopt
+      ;;
+    launch)
+      cmd_launch "$@"
+      ;;
+    next)
+      cmd_cycle next
+      ;;
+    prev)
+      cmd_cycle prev
+      ;;
+    list)
+      cmd_list
+      ;;
+    *)
+      die "unknown command: $cmd (try: ravenslide help)"
+      ;;
+  esac
+}
+
+main "$@"
